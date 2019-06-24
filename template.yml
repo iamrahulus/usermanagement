@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform:
+- AWS::Serverless-2016-10-31
+- AWS::CodeStar
+
+Parameters:
+   ProjectId:
+     Type: String
+     Description: AWS CodeStar projectID used to associate new resources to team members
+   EnvironmentName:
+     Type: String
+     Description: Projects environment to deploy on. 
+   
+Resources:
+  WorkflowVersionTest: 
+   Type: "AWS::Lambda::Version"
+   Properties: 
+    FunctionName: !Ref RegisterUser
+    Description: "A test version of RegisterUser"
+  
+  AliasForMyApp: 
+   Type: "AWS::Lambda::Alias"
+   Properties: 
+    FunctionName: !Ref RegisterUser 
+    FunctionVersion: 
+      Fn::GetAtt: [WorkflowVersionTest, Version]
+    Name: "TestingForMyApp"
+
+  RegisterUser:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: com.aws.codestar.usersmanagement.handler.NewUserRegistrationHandler
+      Runtime: java8
+      Role:
+        Fn::ImportValue:
+          !Join ['-', [!Ref 'ProjectId', !Ref 'AWS::Region', 'LambdaTrustRole']]
+      Environment:
+        Variables:
+            TABLE_NAME: !Ref 'UsersTable'
+      Timeout: 30
+      MemorySize: 256
+      
+  TerminateUser:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: com.aws.codestar.usersmanagement.handler.UserTerminationHandler
+      Runtime: java8
+      Role:
+        Fn::ImportValue:
+          !Join ['-', [!Ref 'ProjectId', !Ref 'AWS::Region', 'LambdaTrustRole']]
+      Environment:
+        Variables:
+            TABLE_NAME: !Ref 'UsersTable'
+            GSI_USERS_TABLE: 'EmailGSI' 
+      Timeout: 30
+      MemorySize: 256
+      
+  UserManagementAPI:
+   Type: AWS::Serverless::Api
+   Properties:
+      StageName: !Ref EnvironmentName
+      DefinitionBody:
+          swagger: "2.0"
+          info:
+                title: "UserManagementAPI"
+                version: "1.0"
+          paths:
+                "/":
+                  post:
+                    responses:
+                        "200":
+                          description: 200 response
+                    x-amazon-apigateway-integration:
+                      responses:
+                         default:
+                            statusCode: "200"
+                      requestTemplates:
+                           application/json: !Sub |
+                             {
+                               "input": "$util.escapeJavaScript($input.json('$'))",
+                               "name": "$context.requestId",
+                               "stateMachineArn": "${UserRegistrationStateMachine}"
+                             }
+                      uri: "arn:aws:apigateway:us-east-1:states:action/StartExecution"
+                      credentials: "arn:aws:iam::190732613123:role/APIGatewayAdmin" 
+                      passthroughBehavior: "when_no_match"
+                      httpMethod: "POST"
+                      type: "aws"
+  StateMachineRole: 
+         Type: AWS::IAM::Role
+         Properties:
+            AssumeRolePolicyDocument:
+                Statement: 
+                - Effect: Allow
+                  Principal: 
+                    Service: 
+                     - !Join [ '.', ['states', !Ref 'AWS::Region', 'amazonaws.com']]
+                  Action:
+                   - sts:AssumeRole
+            Path: !Join ["", ["/", !Ref "AWS::StackName", "/"]]
+            Policies: 
+                - PolicyName: !Join ["", ["-", !Ref "AWS::StackName"]]
+                  PolicyDocument: 
+                   Version: "2012-10-17"
+                   Statement: 
+                    - Effect: Allow
+                      Action:
+                       - lambda:InvokeFunction
+                      Resource: 
+                       - !GetAtt RegisterUser.Arn
+                       - !GetAtt TerminateUser.Arn
+  
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+        TableName: Users
+        KeySchema:
+            -
+              AttributeName: userName
+              KeyType: HASH
+        AttributeDefinitions:
+            - 
+              AttributeName: userName
+              AttributeType: "S"
+            -
+              AttributeName: emailId
+              AttributeType: "S"
+        ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+        GlobalSecondaryIndexes:
+          - 
+            IndexName : "EmailGSI"
+            KeySchema:
+              - 
+                 AttributeName: emailId
+                 KeyType: HASH
+            Projection:
+                 NonKeyAttributes:
+                   - "userName"
+                   - "password"
+                   - "subscribed"
+                 ProjectionType: "INCLUDE"
+            ProvisionedThroughput:
+                 ReadCapacityUnits: 5
+                 WriteCapacityUnits: 5
+   
+  UserRegistrationStateMachine: 
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |-
+        {
+          "StartAt": "OperationsRouter",
+          "States": {
+            "OperationsRouter": {
+            	"Type": "Choice",
+            	"Choices": [
+            	   {
+            	   	  "Variable": "$.operation",
+            	   	  "StringEquals": "Create",
+            	   	  "Next": "RegisterUser"
+            	   },
+            	   {
+            	   	  "Variable": "$.operation",
+                      "StringEquals": "Delete",
+                      "Next": "TerminateUser"
+            	   }
+            	],
+            	"Default": "DefaultState"
+            },
+            "RegisterUser": {
+              "Type": "Task",
+              "Resource": "${RegisterUser.Arn}",
+              "End": true
+            },
+            "TerminateUser": {
+              "Type": "Task",
+              "Resource": "${TerminateUser.Arn}",
+              "End": true
+            },
+            "DefaultState": {
+            	"Type": "Fail",
+            	"Cause": "Operation Not Supported"
+            }
+            
+          }
+        }
+      RoleArn: !GetAtt StateMachineRole.Arn

@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  build:
+    commands: 
+      - echo Entering build phase...
+      - pip install --upgrade awscli
+      - echo Build started on `date`
+      - mvn package shade:shade
+      - mv target/*.jar .
+      - jar -xvf UserManagement-1.0.jar
+      - rm -rf UserManagement-1.0.jar
+      - rm -rf target src buildspec.yml pom.xml
+      - aws cloudformation package --template template.yml --s3-bucket $S3_BUCKET --output-template template-export.json
+artifacts:
+  files:
+    - target/UserManagement-1.0.jar
+    - template-export.json
